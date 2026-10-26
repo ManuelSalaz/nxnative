@@ -1,0 +1,44 @@
+name: Build iOS App & Shaders (nxnative)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mac_input.tar.zst*'
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools (Homebrew & Python)
+        run: |
+          brew install xcodegen zstd spirv-cross glslang
+          if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks | grep -q '^10\.'; then
+            curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
+            echo "$HOME/.dotnet" >> $GITHUB_PATH
+          fi
+          python3 -m pip install --break-system-packages lz4 capstone fonttools "backports.zstd; python_version < '3.14'" || \
+          python3 -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || true
+          fi
+
+      - name: Compile Metal Shaders and iOS App
+        run: |
+          export PATH="$HOME/.dotnet:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          if ls mac_input.tar.zst.part_* >/dev/null 2>&1; then
+            cat mac_input.tar.zst.part_* > mac_input.tar.zst
+          fi
+          python3 scripts/mac_ci_build.py mac_input.tar.zst
+
+      - name: Upload Compiled iOS Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac_output
+          path: mac_output.tar.zst
+          retention-days: 7
+          compression-level: 0
