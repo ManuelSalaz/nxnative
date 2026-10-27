@@ -1,44 +1,90 @@
-name: Build iOS App & Shaders (nxnative)
+name: Fast Parallel iOS Build (10x Matrix)
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'mac_input.tar.zst*'
+      - 'metals_shard_*.tar.zst'
+      - 'tables.tar.zst'
+
+permissions:
+  contents: write
 
 jobs:
-  build-ios:
+  build-app:
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools (Homebrew & Python)
+      - name: Install XcodeGen & Python fonttools
         run: |
-          brew install xcodegen zstd spirv-cross glslang
-          if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks | grep -q '^10\.'; then
-            curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
-            echo "$HOME/.dotnet" >> $GITHUB_PATH
-          fi
-          python3 -m pip install --break-system-packages lz4 capstone fonttools "backports.zstd; python_version < '3.14'" || \
-          python3 -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+          brew install xcodegen zstd
+          python3 -m pip install --break-system-packages fonttools || python3 -m pip install fonttools
+
+      - name: Build DmIOS.app via Xcode
+        run: |
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          cat mac_input.tar.zst.part_* > mac_app_input.tar.zst
+          python3 scripts/mac_build_app_only.py mac_app_input.tar.zst tables.tar.zst
+
+      - name: Upload DmIOS.app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmios-app
+          path: DmIOS_app.tar.zst
+          compression-level: 0
+
+  compile-shaders:
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure zstd & MetalToolchain
+        run: |
+          brew install zstd
           if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain || true
           fi
 
-      - name: Compile Metal Shaders and iOS App
+      - name: Compile Metal Shaders (Shard ${{ matrix.shard }} / 10)
         run: |
-          export PATH="$HOME/.dotnet:/opt/homebrew/bin:/usr/local/bin:$PATH"
-          if ls mac_input.tar.zst.part_* >/dev/null 2>&1; then
-            cat mac_input.tar.zst.part_* > mac_input.tar.zst
-          fi
-          python3 scripts/mac_ci_build.py mac_input.tar.zst
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          python3 scripts/mac_shard_compile.py ${{ matrix.shard }} metals_shard_${{ matrix.shard }}.tar.zst shard_${{ matrix.shard }}.tar.zst
 
-      - name: Upload Compiled iOS Bundle
+      - name: Upload Shard ${{ matrix.shard }}
         uses: actions/upload-artifact@v4
         with:
-          name: mac_output
-          path: mac_output.tar.zst
-          retention-days: 7
+          name: shard-${{ matrix.shard }}
+          path: shard_${{ matrix.shard }}.tar.zst
           compression-level: 0
+
+  publish-release:
+    needs: [build-app, compile-shaders]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge shards and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p merged_metals
+          for f in artifacts/shard-*/shard_*.tar.zst; do
+            tar --zstd -xf "$f" -C merged_metals
+          done
+          tar --zstd -cf compiled_metals.tar.zst -C merged_metals .
+          cp artifacts/dmios-app/DmIOS_app.tar.zst DmIOS_app.tar.zst
+          ls -lh DmIOS_app.tar.zst compiled_metals.tar.zst
+          gh release delete v1.4.3-ios -y --cleanup-tag -R "${{ github.repository }}" 2>/dev/null || true
+          gh release create v1.4.3-ios DmIOS_app.tar.zst compiled_metals.tar.zst -t "TotK 1.4.3 iOS Build" -n "Automated parallel iOS build" -R "${{ github.repository }}"
