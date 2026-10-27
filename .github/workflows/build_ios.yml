@@ -4,26 +4,30 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'metals_shard_*.tar.zst'
-      - 'tables.tar.zst'
+      - '.github/workflows/build_ios.yml'
+      - 'scripts/mac_build_app_only.py'
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build-app:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install XcodeGen & Python fonttools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          brew install xcodegen zstd
+          command -v xcodegen || brew install xcodegen
+          command -v zstd || brew install zstd
           python3 -m pip install --break-system-packages fonttools || python3 -m pip install fonttools
 
-      - name: Build DmIOS.app via Xcode
+      - name: Build DmIOS.app via Xcode 26
         run: |
           export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
           cat mac_input.tar.zst.part_* > mac_app_input.tar.zst
@@ -36,53 +40,34 @@ jobs:
           path: DmIOS_app.tar.zst
           compression-level: 0
 
-  compile-shaders:
-    runs-on: macos-15
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Ensure zstd & MetalToolchain
-        run: |
-          brew install zstd
-          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
-            xcodebuild -downloadComponent MetalToolchain || true
-          fi
-
-      - name: Compile Metal Shaders (Shard ${{ matrix.shard }} / 10)
-        run: |
-          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-          python3 scripts/mac_shard_compile.py ${{ matrix.shard }} metals_shard_${{ matrix.shard }}.tar.zst shard_${{ matrix.shard }}.tar.zst
-
-      - name: Upload Shard ${{ matrix.shard }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: shard-${{ matrix.shard }}
-          path: shard_${{ matrix.shard }}.tar.zst
-          compression-level: 0
-
   publish-release:
-    needs: [build-app, compile-shaders]
+    needs: [build-app]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download DmIOS.app artifact
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: dmios-app
+          path: artifacts/dmios-app
 
-      - name: Merge shards and publish GitHub Release
+      - name: Wait for all 10 shader shards & publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p merged_metals
-          for f in artifacts/shard-*/shard_*.tar.zst; do
+          for i in $(seq 1 30); do
+            cnt=$(gh api repos/${{ github.repository }}/actions/runs/40432283884/artifacts --jq '.artifacts | length')
+            echo "Shards ready in run 40432283884: $cnt / 10"
+            if [ "$cnt" -ge 10 ]; then
+              break
+            fi
+            sleep 10
+          done
+          mkdir -p artifacts_shards merged_metals
+          gh run download 40432283884 -D artifacts_shards -R "${{ github.repository }}"
+          for f in artifacts_shards/shard-*/shard_*.tar.zst; do
             tar --zstd -xf "$f" -C merged_metals
           done
+          echo "Total compiled .metallib files merged: $(ls merged_metals | wc -l)"
           tar --zstd -cf compiled_metals.tar.zst -C merged_metals .
           cp artifacts/dmios-app/DmIOS_app.tar.zst DmIOS_app.tar.zst
           ls -lh DmIOS_app.tar.zst compiled_metals.tar.zst

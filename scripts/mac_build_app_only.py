@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Builds ONLY DmIOS.app via Xcode on macOS (takes ~90 seconds), using the pre-generated
+Builds ONLY DmIOS.app via Xcode on macOS-26 (takes ~90 seconds), using the pre-generated
 c1_full.tsv, cb_extent.tsv, and inputs.tsv from Linux!
 """
 import json, os, shutil, subprocess, sys
@@ -87,7 +87,15 @@ def main():
     if (work / 'icon.jpg').is_file():
         ipa_env['DM_ICON'] = str(work / 'icon.jpg')
 
-    b.run(['bash', REPO / 'dm/ios/tools/build_ipa.sh', dummy_ipa], logs / 'build_ipa.log', env=ipa_env)
+    res = subprocess.run(['bash', str(REPO / 'dm/ios/tools/build_ipa.sh'), str(dummy_ipa)], env=ipa_env)
+    if res.returncode != 0:
+        build_log = ipa_work / 'build/ios/pkg/build.log'
+        if build_log.is_file():
+            print('=== LAST 100 LINES OF xcodebuild build.log ===', flush=True)
+            lines = build_log.read_text(errors='replace').splitlines()
+            print('\n'.join(lines[-100:]), flush=True)
+        sys.exit(res.returncode)
+
     app_dir = ipa_work / 'build/ios/pkg/dd/Build/Products/Release-iphoneos/DmIOS.app'
     if not app_dir.is_dir():
         sys.exit(f'Built app not found at {app_dir}')
